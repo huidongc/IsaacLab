@@ -2201,6 +2201,10 @@ def rendering_test_franka_cloth(
 
     env_cfg = _apply_overrides_to_env_cfg(env_cfg, [f"presets={physics_preset_name},{renderer}"])
     _configure_franka_camera_test_env_cfg(env_cfg, data_types)
+    # Training ramps gravity from ~0 → -9.81; without this, reset installs g≈0 and the cloth floats.
+    # Same as FrankaSoftEnvCfg.play_mode(): keep variable_gravity's fixed -9.81.
+    if env_cfg.curriculum is not None:
+        env_cfg.curriculum.gravity = None
     if is_newton_ovrtx_motion:
         initial_pos = env_cfg.scene.deformable.init_state.pos
         env_cfg.scene.deformable.init_state.pos = (initial_pos[0], initial_pos[1], initial_pos[2] + 0.01)
@@ -2209,6 +2213,44 @@ def rendering_test_franka_cloth(
 
     test_name = "franka_cloth"
     env = None
+    gif_steps = _rendering_gif_step_count()
+    if gif_steps is not None:
+        # Drop the cloth from above the supports so the GIF captures visible free fall.
+        cloth_lift = 0.45
+        initial_pos = env_cfg.scene.deformable.init_state.pos
+        env_cfg.scene.deformable.init_state.pos = (initial_pos[0], initial_pos[1], initial_pos[2] + cloth_lift)
+        # Raise the supports to the same height as the cloth and offset them to the left of the tile.
+        for support_name in ("support_neg_y", "support_pos_y"):
+            support = getattr(env_cfg.scene, support_name)
+            sp = support.init_state.pos
+            support.init_state.pos = (sp[0] - 0.15, sp[1] - 0.15, sp[2] + cloth_lift)
+            # Enable gravity and make the supports dynamic so they fall with the cloth.
+            support.spawn.rigid_props.disable_gravity = False
+            support.spawn.rigid_props.kinematic_enabled = False
+        # Soften the cloth so the free-fall deformation is visible in the GIF.
+        material = env_cfg.scene.deformable.spawn.physics_material
+        for attr in ("youngs_modulus", "surface_bend_stiffness"):
+            if getattr(material, attr, None) is not None:
+                setattr(material, attr, getattr(material, attr) * 0.1)
+        for attr in ("tri_ke", "tri_ka", "edge_ke"):
+            if getattr(material, attr, None) is not None:
+                setattr(material, attr, getattr(material, attr) * 0.1)
+        # Raise damping so the cloth does not rebound after hitting the table.
+        for attr in ("elasticity_damping", "bend_damping"):
+            if getattr(material, attr, None) is not None:
+                setattr(material, attr, getattr(material, attr) * 100.0)
+        for attr in ("tri_kd", "edge_kd"):
+            if getattr(material, attr, None) is not None:
+                setattr(material, attr, getattr(material, attr) * 100.0)
+        # Add settling damping and cap rebound velocity on the deformable body itself.
+        deformable_props = env_cfg.scene.deformable.spawn.deformable_props
+        if deformable_props is not None:
+            if hasattr(deformable_props, "settling_damping"):
+                deformable_props.settling_damping = 10.0
+            if hasattr(deformable_props, "settling_threshold"):
+                deformable_props.settling_threshold = 0.5
+            if hasattr(deformable_props, "max_linear_velocity"):
+                deformable_props.max_linear_velocity = 2.0
 
     try:
         env = ManagerBasedRLEnv(env_cfg)
@@ -2216,8 +2258,17 @@ def rendering_test_franka_cloth(
 
         maybe_save_stage(test_name, physics_backend, renderer, data_types[0])
 
-        # Step once so the cloth begins settling between the supports while limiting solver-dependent nodal drift.
         zero_actions = torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device)
+
+        if gif_steps is not None:
+            frames: list[Image.Image] = []
+            for _ in range(gif_steps):
+                env.step(zero_actions)
+                frames.append(_camera_outputs_to_pil_image(env.scene.sensors["base_camera"].data.output))
+            save_rendering_gif(frames, test_name, physics_backend, renderer, data_types[0])
+            return
+
+        # Step once so the cloth begins settling between the supports while limiting solver-dependent nodal drift.
         env.step(zero_actions)
         # TODO: Remove the extra step when NVBug 6565960 is fixed.
         if is_newton_ovrtx_motion:
